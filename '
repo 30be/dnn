@@ -1,0 +1,544 @@
+### Imports
+
+import json
+from functools import partial
+import os
+import time
+import numpy as np
+import torch
+from torch import nn
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
+from datetime import datetime
+import matplotlib.patches as patches
+from svetlanna.units import ureg
+from svetlanna import SimulationParameters, simulation_parameters
+from svetlanna.parameters import ConstrainedParameter
+from svetlanna.transforms import ToWavefront
+from svetlanna.elements import (
+    FreeSpace,
+    RectangularAperture,
+    DiffractiveLayer,
+)
+from svetlanna.setup import LinearOpticalSetup
+from svetlanna.detector import Detector, DetectorProcessorClf
+from src.wf_datasets import DatasetOfWavefronts
+from src.clf_loops import onn_train_clf, onn_validate_clf
+import itertools
+from pathlib import Path
+import matplotlib
+import tqdm
+from matplotlib import pyplot as plt
+import shutil
+
+RESULTS_FOLDER = Path("results")
+
+
+def exp_to_hist(exp, groups=[(4, 7, 9), (4, 5, 8)]):
+    m = torch.load(exp / "confusion_matrix.pt")
+    hist = {}
+    for group_ind, group in enumerate(groups):
+        for i, j in itertools.combinations(group, 2):
+            hist[f"{group_ind}: {i}-{j}"] = m[i][j] + m[j][i]
+    return hist
+
+
+def plot_confusion(hist, name):
+    plt.figure(figsize=(10, 6))
+    plt.bar(hist.keys(), hist.values())
+    plt.xlabel("Index Pairs")
+    plt.ylabel("Average Value")
+    plt.title(name)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+
+def average_on(param: str, value):
+    hist = {}
+    amount = 0
+    for exp_path in RESULTS_FOLDER.iterdir():
+        conditions_path = exp_path / "conditions.json"
+        if not conditions_path.exists():
+            continue
+
+        with open(conditions_path) as f:
+            metadata = json.load(f)
+
+        if metadata.get(param) == value:
+            for key, val in exp_to_hist(exp_path).items():
+                hist[key] = hist.get(key, 0) + val
+            amount += 1
+
+    for key in hist:
+        hist[key] /= amount
+    plot_confusion(hist, f"Average Histogram for '{param}' = '{value}' (averaged over {amount} experiments)")
+
+
+# plot_confusion(exp_to_hist(RESULTS_FOLDER / name), name)
+matplotlib.use("TkAgg")
+plt.style.use("dark_background")
+
+# Constants
+
+DIR_RESULTS = "results"
+MAX_PHASE = 2 * np.pi  # TODO: Try to remove it
+FREESPACE_METHOD = "AS"  # we use an angular spectrum method
+MODULATION_TYPE = "amp"  # We will not touch initial phase
+NUMBER_OF_CLASSES = 10
+ZONES_HIGHLIGHT_COLOR = "w"
+ZONES_LW = 0.5
+DEVICE = "cpu"
+C_CONST = 299_792_458  # [m / s]
+NUMBER_OF_CLASSES = 10
+MNIST_DATA_FOLDER = Path("./data")  # folder to store data
+
+MNIST_DATA_FOLDER.mkdir(exist_ok=True)
+
+
+def get_transforms(detector_size, x_layer_nodes, y_layer_nodes, modulation_type):
+    resize_y = int(detector_size[0] / 2)
+    resize_x = int(detector_size[1] / 2)  # shape for transforms.Resize
+
+    # paddings along OY
+    pad_top = int((y_layer_nodes - resize_y) / 2)
+    pad_bottom = y_layer_nodes - pad_top - resize_y
+    # paddings along OX
+    pad_left = int((x_layer_nodes - resize_x) / 2)
+    pad_right = x_layer_nodes - pad_left - resize_x  # params for transforms.Pad
+
+    # compose all transforms!
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Resize(
+                size=(resize_y, resize_x),
+                interpolation=InterpolationMode.NEAREST,
+            ),
+            transforms.Pad(
+                padding=(
+                    pad_left,  # left padding
+                    pad_top,  # top padding
+                    pad_right,  # right padding
+                    pad_bottom,  # bottom padding
+                ),
+                fill=0,
+            ),  # padding to match sizes!
+            ToWavefront(modulation_type=modulation_type),  # <- select modulation type!!!
+        ]
+    )
+
+
+def get_zones_patches(detector_mask, delta=0.5):
+    def zone_patch(ind_class):
+        idx_y, idx_x = (detector_mask == ind_class).nonzero(as_tuple=True)
+        return patches.Rectangle(
+            (idx_x[0] - delta, idx_y[0] - delta),
+            idx_x[-1] - idx_x[0] + 2 * delta,
+            idx_y[-1] - idx_y[0] + 2 * delta,
+            linewidth=ZONES_LW,
+            edgecolor=ZONES_HIGHLIGHT_COLOR,
+            facecolor="none",
+        )
+
+    return [zone_patch(i) for i in range(NUMBER_OF_CLASSES)]
+
+
+def get_setup(
+    num_layers, simulation_parameters, freespace_method, phase_values, apertures, aperture_size, free_space_distance
+):
+    free_space = lambda: [FreeSpace(simulation_parameters, free_space_distance, freespace_method)]
+    aperture = lambda: [RectangularAperture(simulation_parameters, *aperture_size)] if apertures else []
+    phase_layer = lambda phase: DiffractiveLayer(
+        simulation_parameters,
+        ConstrainedParameter(torch.full(simulation_parameters.axes_size(("H", "W")), phase), 0, 2 * np.pi),
+    )
+
+    layer = lambda i: aperture() + [phase_layer(phase_values[i].item())] + free_space()
+    layers = list(itertools.chain(*map(layer, range(num_layers))))
+    return LinearOpticalSetup(free_space() + layers + aperture() + [Detector(simulation_parameters, "intensity")])
+
+
+def get_detector_mask(segment_size_in_neurons: int, segment_dist: int, mesh_size, order_of_digits, sim_params):
+    if not len(order_of_digits) == NUMBER_OF_CLASSES:
+        print("Wrong ordering list!")
+
+    t = torch.ones(mesh_size) * -1
+
+    x_grid, y_grid = sim_params.meshgrid(x_axis="W", y_axis="H")
+    reg = 2 * torch.pi / 10
+    for i in range(10):
+        ang = torch.atan2(y_grid, x_grid) + torch.pi
+        t[(reg * (i + 1) > ang) & (ang > reg * i)] = order_of_digits[i]
+    # plt.imshow(t, cmap="gray")
+    # plt.colorbar()
+    # plt.show()
+    return t
+
+    upper = [(-1, 1), (0, 1), (1, 1)]
+    lower = [(-1, -1), (0, -1), (1, -1)]
+    middle = [(-1.5, 0), (-0.5, 0), (0.5, 0), (1.5, 0)]
+    for i, (x, y) in enumerate(lower + middle + upper):
+        if i not in order_of_digits:
+            print("Wrong ordering list!")
+        x_start = int(
+            segment_size_in_neurons
+            + x * segment_dist
+            + mesh_size[1] // 2
+            - segment_size_in_neurons // 2
+            - segment_dist // 2
+        )
+        y_start = int(
+            segment_size_in_neurons
+            + y * segment_dist
+            + mesh_size[0] // 2
+            - segment_size_in_neurons // 2
+            - segment_dist // 2
+        )
+        t[
+            y_start : y_start + int(segment_size_in_neurons),
+            x_start : x_start + int(segment_size_in_neurons),
+        ] = order_of_digits[i]
+        print(f"Adding segment for class {order_of_digits[i]} which is {i}th at ({x_start}, {y_start})")
+    return t
+
+
+# TODO: try to remove all parameters here
+def get_mnist(sim_params: SimulationParameters, train_val_split_seed, train_bs, val_bs, modulation_type):
+    mesh = sim_params.axes_size(("H", "W"))  # TODO: Check x-y sizes here
+    image_transform_for_ds = get_transforms(mesh, mesh[1], mesh[0], modulation_type)
+
+    mnist = partial(torchvision.datasets.MNIST, MNIST_DATA_FOLDER, download=True)
+    mnist_wf = partial(DatasetOfWavefronts, transformations=image_transform_for_ds, sim_params=sim_params)
+    mnist_wf_train_ds = mnist_wf(init_ds=mnist(train=True))
+    mnist_wf_test_ds = mnist_wf(init_ds=mnist(train=False))
+    train_wf_ds, val_wf_ds = torch.utils.data.random_split(
+        dataset=mnist_wf_train_ds,
+        lengths=[55000, 5000],  # sizes from the article
+        generator=torch.Generator().manual_seed(train_val_split_seed),  # for reproducibility
+    )
+
+    train_wf_loader = torch.utils.data.DataLoader(train_wf_ds, train_bs, shuffle=True)
+    val_wf_loader = torch.utils.data.DataLoader(val_wf_ds, val_bs)
+    return train_wf_loader, val_wf_loader, mnist_wf_test_ds
+
+
+RESULTS_FOLDER = Path("results")
+
+
+def plot_loss_curves(exp):
+    number_of_epochs, train_epochs_losses, val_epochs_losses, train_epochs_acc, val_epochs_acc = np.genfromtxt(
+        RESULTS_FOLDER / exp / "training_curves.csv", delimiter=","
+    )
+    print(val_epochs_acc)
+    fig, axs = plt.subplots(1, 2, figsize=(10, 3))
+
+    axs[0].plot(range(1, number_of_epochs + 1), np.array(train_epochs_losses), label="train")
+    axs[0].plot(range(1, number_of_epochs + 1), np.array(val_epochs_losses), linestyle="dashed", label="validation")
+
+    axs[1].plot(range(1, number_of_epochs + 1), train_epochs_acc, label="train")
+    axs[1].plot(range(1, number_of_epochs + 1), val_epochs_acc, linestyle="dashed", label="validation")
+
+    axs[0].set_ylabel("Loss")
+    axs[0].set_xlabel("Epoch")
+    axs[0].legend()
+
+    axs[1].set_ylabel("Accuracy")
+    axs[1].set_xlabel("Epoch")
+    axs[1].legend()
+
+    plt.show()
+
+
+def get_sim_params(v):
+    print("Layer size x, m:", x_layer_size := v["mesh_size"][1] * v["neuron_size"])
+    print("Layer size y, m:", y_layer_size := v["mesh_size"][0] * v["neuron_size"])
+
+    return SimulationParameters(
+        axes={
+            "W": torch.linspace(-x_layer_size / 2, x_layer_size / 2, v["mesh_size"][1]),
+            "H": torch.linspace(-y_layer_size / 2, y_layer_size / 2, v["mesh_size"][0]),
+            "wavelength": v["wavelength"],
+        }
+    )
+
+
+def plot_difflayers(optical_setup):
+    diff_layers = [layer for layer in optical_setup.net if isinstance(layer, DiffractiveLayer)]
+    n_cols = len(diff_layers)
+    n_rows = 1
+
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3.2))
+
+    for ind_diff_layer, layer in enumerate(diff_layers):
+        if n_rows > 1:
+            ax_this = axs[ind_diff_layer // n_cols][ind_diff_layer % n_cols]
+        else:
+            ax_this = axs[ind_diff_layer % n_cols]
+
+        ax_this.set_title(f"{ind_diff_layer + 1}. DiffractiveLayer")
+        im = ax_this.imshow(layer.mask.detach(), "gist_stern")
+        fig.colorbar(im)
+
+
+def eval(v):
+    _, _, test_wf_loader = get_mnist(
+        get_sim_params(v),
+        train_val_split_seed=v["train_val_seed"],
+        train_bs=v["train_batch_size"],
+        val_bs=v["val_batch_size"],
+        modulation_type="AS",
+    )
+    test_losses_1, _, test_accuracy_1 = onn_validate_clf(
+        optical_setup_loaded.net,  # optical network with loaded weights
+        test_wf_loader,  # dataloader of training set
+        detector_processor,  # detector processor
+        loss_func_clf,
+        device=DEVICE,
+        show_process=True,
+    )  # evaluate the model
+
+
+def plot_wavefront(test_wavefront, ind_test):
+    cmap = "hot"
+
+    fig, axs = plt.subplots(1, 2, figsize=(2 * 3, 3))
+
+    axs[0].set_title(f"intensity (id={ind_test})")
+    axs[0].imshow(test_wavefront.intensity, cmap)
+
+    axs[1].set_title(f"phase")
+    axs[1].imshow(test_wavefront.phase, cmap)
+
+
+def plot_intensity(wavefront):
+    fig, ax_this = plt.subplots(1, 1, figsize=(3, 3.2))
+    ax_this.set_title("Detector Intensity")
+    ax_this.imshow(wavefront.detach(), cmap="hot")
+
+    for zone in get_zones_patches(detector_mask):
+        ax_this.add_patch(zone)
+
+
+def make_confusion():
+    targets_test_lst = []
+    preds_test_lst = []  # lists of targets and model predictioons
+
+    # loop over the test dataset
+    for ind, (wavefront_this, target_this) in enumerate(tqdm(mnist_wf_test_ds)):
+        optical_setup_loaded.net.eval()
+
+        batch_wavefronts = torch.unsqueeze(wavefront_this, 0)
+        batch_labels = torch.unsqueeze(torch.tensor(target_this), 0)  # to use forwards for batches
+
+        with torch.no_grad():
+            detector_output = optical_setup_loaded.net(batch_wavefronts)
+            # process a detector image
+            batch_probas = detector_processor.batch_forward(detector_output)
+
+            for ind_in_batch in range(batch_labels.size()[0]):
+                label_this = batch_labels[ind_in_batch].item()  # true label
+
+                targets_test_lst.append(label_this)
+                preds_test_lst.append(batch_probas[ind_in_batch].argmax().item())
+    confusion_matrix = torch.zeros(
+        size=(10, 10),  # TODO: What is the size of the matrix?
+        dtype=torch.int32,
+    )
+
+    for ind in range(len(mnist_wf_test_ds)):
+        confusion_matrix[targets_test_lst[ind], preds_test_lst[ind]] += 1
+    return confusion_matrix
+
+
+def plot_confusion_matrix(confusion_matrix):
+    fig, ax0 = plt.subplots(1, 1, figsize=(6, 5))
+
+    # CONFUSION MATRIX
+    ax0.set_title("Confusion matrix")
+    ax0.matshow(confusion_matrix, cmap="Blues")
+
+    for i in range(NUMBER_OF_CLASSES):
+        for j in range(NUMBER_OF_CLASSES):
+            val = confusion_matrix[j, i].item()
+            ax0.text(i, j, str(val), va="center", ha="center", c="k", fontsize=9)
+
+    ax0.set_ylabel("Target")
+    ax0.set_xlabel("Predicted")
+
+    ax0.set_xticks(range(10))
+    ax0.set_yticks(range(10))
+
+    plt.show()
+
+
+def const_diff_layers(num_layers, extra_condition="exp"):
+    for file in os.listdir(DIR_RESULTS):
+        filename = os.fsdecode(file)
+        if os.path.isdir(os.path.join(DIR_RESULTS, filename)):  ## OS DECODE?
+            results_folder = f"{DIR_RESULTS}/{filename}"
+            conditions_file = f"{results_folder}/conditions.json"
+            if os.path.exists(conditions_file):
+                with open(conditions_file) as json_file:
+                    loaded_var = json.load(json_file)
+                if extra_condition not in filename:
+                    continue
+                if "num_diff_layers" in loaded_var.keys() and loaded_var["num_diff_layers"] == num_layers:
+                    yield filename
+
+                if "number_of_diff_layers" in loaded_var.keys() and loaded_var["number_of_diff_layers"] == num_layers:
+                    yield filename
+
+
+import matplotlib.cm as cm
+
+
+def plot_filtered(ax, filt, title, prec=False):
+    def digit_acc(digit, exp):
+        try:
+            m = torch.load(RESULTS_FOLDER / exp / "confusion_matrix.pt")
+        except:
+            return None
+        if prec:
+            return m[digit][digit] / sum(m[i][digit] for i in range(len(m[9])))
+        else:
+            return m[digit][digit] / sum(m[digit])
+
+    colormap = cm.get_cmap("rainbow")
+    gradient_values = np.linspace(0, 1, 10)
+    colors = [colormap(value) for value in gradient_values]
+
+    def plot_digit(i):
+        avg_accs = []
+        rng = []
+        for diff_layer in range(1, 6):
+            avg_acc = 0
+            filtered_exps = list(const_diff_layers(diff_layer, filt))
+            with_matrix = 0
+            for exp in filtered_exps:
+                acc = digit_acc(i, exp)
+                if acc:
+                    avg_acc += acc
+                    with_matrix += 1
+            if with_matrix != 0:
+                ax.plot([diff_layer], [avg_acc / with_matrix], ".", color=colors[i])
+                avg_accs.append(avg_acc / with_matrix)
+                rng.append(diff_layer)
+        ax.plot(rng, avg_accs, color=colors[i], label=i)
+        return avg_accs
+
+    # TODO: Fix no-experiment issue
+    digit_lists = []
+    for i in range(10):
+        digit_lists.append(plot_digit(i))
+
+    ax.set_title(title)
+    ax.legend()
+    # Add grid
+    ax.grid(True)
+
+    # Set y-axis scale from 0 to 1 (for accuracy)
+    if prec:
+        ax.set_ylim(0.5, 1)
+    else:
+        ax.set_ylim(0.2, 1)
+    ax.set_ylabel("Precision" if prec else "Recall")
+    ax.set_xlabel("Diffractive layers")
+    # Set x-axis scale if desired (e.g., from 0.5 to 5.5 to encompass diff_layer range)
+    # You might adjust the x-axis limits based on your 'diff_layer' range.
+    return digit_lists
+
+
+def plot_recall(filt):
+    fig, axes = plt.subplots(1, 1, figsize=(14, 6))
+    dl1 = plot_filtered(axes, filt, "Recall for processor setup 1", prec=False)  # [[layers] * digits]
+    plt.show()
+    return dl1
+
+
+def plot_precision(filt):
+    fig, axes = plt.subplots(1, 1, figsize=(14, 6))
+    dl1 = plot_filtered(axes, filt, "Precision for processor setup 1", prec=True)  # [[layers] * digits]
+    plt.show()
+    return dl1
+
+
+def plot_precision_for_digits(dl1, dl2):
+    for i, (digit1_list, digit2_list) in enumerate(zip(dl1, dl2)):
+        data = [digit1_list[i] - digit2_list[i] for i in range(len(digit2_list))]
+        plt.plot([1, 2, 3, 5], data, label=i)
+        plt.title("Precision difference for different digits")
+        plt.xlabel("Diffractive layers")
+        plt.ylabel("Precision difference")
+        plt.legend()
+    plt.plot()
+
+
+def plot_confusion_matrices(filt, diff_layers):
+    for layer in diff_layers:
+        if exps := list(const_diff_layers(layer, filt)):
+            if not (RESULTS_FOLDER / exps[0] / "confusion_matrix.pt").exists():
+                make_confusion(exps[0])
+            confusion_matrix = torch.load(RESULTS_FOLDER / exps[0] / "confusion_matrix.pt")
+            plot_confusion_matrix(confusion_matrix)
+        else:
+            print(f"No experiments filtered as {filt} for {layer} difflayers")
+
+
+def get_accuracy(exp):
+    if not (RESULTS_FOLDER / exp / "confusion_matrix.pt").exists():
+        make_confusion(exp)
+    confusion_matrix = torch.load(RESULTS_FOLDER / exp / "confusion_matrix.pt")
+    right = confusion_matrix.diag().sum()
+    return right / (confusion_matrix.sum() - right)
+
+
+def plot_all(losses):
+    with open(RESULTS_FOLDER / exp / "conditions.json") as f:
+        v = json.load(f)
+    print(v)
+    init_phases = torch.ones(v["num_diff_layers"]) * np.pi
+    test_batch_size = 10
+    detector_segment_size_m = v["detector_segment_size"] * v["neuron_size"]
+    sim_params = get_sim_params(v)
+    detector_mask = torch.load(RESULTS_FOLDER / exp / "detector_mask.pt")
+    detector_processor = DetectorProcessorClf(  # TODO: What does Clf mean
+        simulation_parameters=sim_params,
+        num_classes=NUMBER_OF_CLASSES,
+        segmented_detector=detector_mask,
+    )
+    selected_detector_mask = detector_processor.segmented_detector.clone().detach()  # ???
+    loss_func_clf = torch.nn.CrossEntropyLoss()
+    loss_func_name = "CE loss"
+    losses_data = np.genfromtxt(f"{RESULTS_FOLDER}/training_curves.csv", delimiter=",")
+    plot_loss_curves(*losses_data[1:, :].T)
+
+
+def plot_accuracy(filt):
+    accuracies = []
+    diff_layers = [1, 2, 3, 5]
+    for diff_layer in diff_layers:
+        avg_acc = 0
+        accuracies_found = 0
+        for exp in const_diff_layers(diff_layer, filt):
+            avg_acc += (acc := get_accuracy(exp))
+            plt.plot([diff_layer], [acc])
+            accuracies_found += 1
+        accuracies.append(avg_acc / accuracies_found)
+    plt.plot(diff_layers, accuracies, label="Average accuracy")
+
+
+def plot_all_for(filt):
+    plot_recall(filt)
+    dl1 = plot_precision(filt)
+    plot_confusion_matrices(filt, [1, 2, 3, 5])
+    plot_accuracy(filt)
+    return dl1
+
+
+plot_all_for("exp_2")
+plot_all_for("exp_zones")
+plot_all_for("exp_triplets")
+plot_all_for("exp_radial")
+plot_loss_curves("exp")

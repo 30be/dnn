@@ -82,15 +82,32 @@ def get_setup(
     return LinearOpticalSetup(free_space() + layers + aperture() + [Detector(simulation_parameters, "intensity")])
 
 
-def get_detector_mask(segment_size_in_neurons: int, segment_dist: int, mesh_size, order_of_digits):
+import matplotlib
+from matplotlib import pyplot as plt
+
+# matplotlib.use("TkAgg")
+# plt.style.use("dark_background")
+
+
+def get_detector_mask(segment_size_in_neurons: int, segment_dist: int, mesh_size, order_of_digits, sim_params):
     if not len(order_of_digits) == NUMBER_OF_CLASSES:
         print("Wrong ordering list!")
 
     t = torch.ones(mesh_size) * -1
+
+    x_grid, y_grid = sim_params.meshgrid(x_axis="W", y_axis="H")
+    reg = 2 * torch.pi / 10
+    for i in range(10):
+        ang = torch.atan2(y_grid, x_grid) + torch.pi
+        t[(reg * (i + 1) > ang) & (ang > reg * i)] = order_of_digits[i]
+    # plt.imshow(t, cmap="rainbow")
+    # plt.colorbar()
+    # plt.show()
+    return t
+
     upper = [(-1, 1), (0, 1), (1, 1)]
     lower = [(-1, -1), (0, -1), (1, -1)]
     middle = [(-1.5, 0), (-0.5, 0), (0.5, 0), (1.5, 0)]
-
     for i, (x, y) in enumerate(lower + middle + upper):
         if i not in order_of_digits:
             print("Wrong ordering list!")
@@ -128,7 +145,7 @@ def save(
 ):
     today_date = datetime.today().strftime("%d-%m-%Y_%H-%M")  # date for a results folder name
 
-    RESULTS_FOLDER = f"results/exp_{today_date}"
+    RESULTS_FOLDER = f"results/exp_radial_{today_date}"
 
     if not os.path.exists(RESULTS_FOLDER):
         os.makedirs(RESULTS_FOLDER)
@@ -209,7 +226,9 @@ def actually_train(
     val_epochs_acc = []  # to store accuracies
 
     for epoch in range(num_epochs):
+        print()
         print(f"Epoch #{epoch + 1} of {num_epochs}: ", end="")
+        print()
         show_progress = True
 
         # TRAIN
@@ -267,14 +286,14 @@ def train(
     modulation_type="amp",  # using ONLY amplitude to encode each picture in a Wavefront!
     num_of_diff_layers=3,
     num_epochs=10,
-    torch_seed=4,
+    torch_seed=int(time.time()),
     free_space_distance=40,
     free_space_method="AS",  # we use an angular spectrum method
     detector_segment_size=6.4,
     zones_order=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     train_bs=20,  # a batch size for training set
     val_bs=8,
-    train_val_split_seed=40,
+    train_val_split_seed=int(time.time()),
     LR=1e-3,
 ):
     neuron_size *= wavelength
@@ -303,8 +322,9 @@ def train(
         "val_batch_size": val_bs,
         "adam_lr": LR,  # learning rate for Adam optimizer
         "number_of_epochs": num_epochs,  # number of epochs to train
-        "num_of_diff_layers": num_of_diff_layers,
+        "num_diff_layers": num_of_diff_layers,
     }
+    print(variables)
     sim_params = SimulationParameters(
         axes={
             "W": torch.linspace(-x_layer_size_m / 2, x_layer_size_m / 2, x_layer_nodes),
@@ -315,7 +335,9 @@ def train(
 
     init_phases = torch.full((num_of_diff_layers,), np.pi)
 
-    detector_mask = get_detector_mask(detector_segment_size_m, detector_segment_size_m * 2, mesh_size, zones_order)
+    detector_mask = get_detector_mask(
+        detector_segment_size_m, detector_segment_size_m * 2, mesh_size, zones_order, sim_params
+    )
 
     loss_func_name = "CE loss"
     # Recreate a system to restart training!
@@ -333,7 +355,7 @@ def train(
     save(variables, detector_mask, loss_func_name, optical_setup_to_train, *losses)
 
 
-train(num_epochs=0)  # test
-for i in range(1, 6):
-    print(f"Training {i}th diff layer with new zone order.")
-    train(num_of_diff_layers=i, zones_order=[0, 1, 2, 9, 4, 5, 6, 7, 8, 3])
+# train(num_epochs=0)  # test
+for i in [1, 2, 3, 5, 6, 7]:
+    print(f"Training {i}th diff layer with the radial pattern.")
+    train(num_of_diff_layers=i)
